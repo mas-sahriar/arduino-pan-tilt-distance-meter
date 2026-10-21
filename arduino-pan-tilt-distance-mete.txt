@@ -1,0 +1,250 @@
+
+#include <Arduino.h>
+#include <Servo.h>
+#include <LiquidCrystal.h>
+#include <stdio.h>
+#include <avr/interrupt.h>
+#include <util/atomic.h>
+
+#if !defined(__AVR_ATmega328P__)
+#error "Select Arduino Uno (ATmega328P) for this sketch."
+#endif
+
+const bool ENABLE_LASER_OUTPUT = true; // Active-HIGH control on D3 enabled.
+// Set true to test the sensor/LCD with motors and laser disabled in software.
+const bool SENSOR_ONLY_TEST = false;
+const bool REVERSE_X = false;
+const bool REVERSE_Y = false;
+const uint8_t BUTTON_PIN = 2, LASER_PIN = 3;
+const uint8_t TRIG_PIN = 8, ECHO_PIN = 9, SERVO_PIN = 10;
+const uint8_t MOTOR_PINS[4] = {4, 5, 6, 7};
+const int DEAD_ZONE = 70;
+const int MAX_STEP_RATE = 650; // Half-steps/second; reduce if motor stalls.
+const long PAN_LIMIT = 1024;  // Roughly +/-90 degrees; gearing varies.
+const float TILT_MIN = 30, TILT_MAX = 150;
+const uint8_t HALF_STEP[8][4] = {
+  {1,0,0,0}, {1,1,0,0}, {0,1,0,0}, {0,1,1,0},
+  {0,0,1,0}, {0,0,1,1}, {0,0,0,1}, {1,0,0,1}
+};
+
+LiquidCrystal lcd(11, 12, A2, A3, A4, A5);
+Servo tiltServo;
+int centreX = 512, centreY = 512;
+int xCommand = 0, yCommand = 0, stepRate = 0;
+long panPosition = 0;
+uint8_t phase = 0;
+float tiltAngle = 90;
+bool buttonPressed = false, buttonReady = false, lastRaw = HIGH;
+uint32_t rawChangedMs = 0, lastControlsMs = 0, lastRampMs = 0;
+uint32_t lastTiltMs = 0, lastStepUs = 0;
+
+// D9 is PB1/PCINT1 on the Uno. Capture BOTH edges with a pin-change ISR.
+// This does not use Timer1, which remains available to the Servo library.
+volatile uint8_t rangeState = 0; // 0=idle, 1=wait rise, 2=wait fall, 3=ready
+volatile uint32_t echoRiseUs = 0, echoWidthUs = 0;
+uint32_t lastPingUs = 0;
+uint8_t rangeError = 1; // 0=valid, 1=no echo, 2=stuck HIGH, 3=out of range
+int distanceCm = -1;
+char topLine[17] = "Dist: --- cm    ";
+char bottomLine[17] = "Tilt: 90 B:0    ";
+uint8_t displayIndex = 0;
+uint32_t lastDisplayMs = 0, lastTextMs = 0;
+
+ISR(PCINT0_vect) {
+  bool high = digitalRead(ECHO_PIN) == HIGH;
+  if (rangeState == 1 && high) {
+    echoRiseUs = micros();
+    rangeState = 2;
+  } else if (rangeState == 2 && !high) {
+    echoWidthUs = (uint32_t)micros() - echoRiseUs;
+    rangeState = 3;
+  }
+}
+
+void reportRange(uint32_t pulseUs) {
+  Serial.print(F("Echo_us=")); Serial.print(pulseUs);
+  if (rangeError == 0) {
+    Serial.print(F(" Distance_cm=")); Serial.println(distanceCm);
+  } else if (rangeError == 1) Serial.println(F(" NO_ECHO"));
+  else if (rangeError == 2) Serial.println(F(" ECHO_STUCK_HIGH"));
+  else Serial.println(F(" OUT_OF_RANGE"));
+}
+
+void setMotorPhase() {
+  for (uint8_t i = 0; i < 4; ++i)
+    digitalWrite(MOTOR_PINS[i], HALF_STEP[phase][i]);
+}
+
+// Normalized command -100..100 with dead zone around calibrated centre.
+int readAxis(uint8_t pin, int centre, bool reverse) {
+  int delta = analogRead(pin) - centre;
+  if (abs(delta) <= DEAD_ZONE) return 0;
+  int span = (delta > 0 ? 1023 - centre : centre) - DEAD_ZONE;
+  if (span < 1) return 0;
+  int command = constrain((abs(delta) - DEAD_ZONE) * 100L / span, 0L, 100L);
+  if (delta < 0) command = -command;
+  return reverse ? -command : command;
+}
+
+void updateButton() {
+  bool raw = digitalRead(BUTTON_PIN);
+  uint32_t now = millis();
+  if (raw != lastRaw) { lastRaw = raw; rawChangedMs = now; }
+  // Immediate release; require a stable press and a release after reset.
+  if (raw == HIGH) {
+    buttonPressed = false;
+    if (now - rawChangedMs >= 25) buttonReady = true;
+  } else if (buttonReady && now - rawChangedMs >= 25) {
+    buttonPressed = true;
+  }
+  digitalWrite(LED_BUILTIN, buttonPressed ? HIGH : LOW);
+  digitalWrite(LASER_PIN, !SENSOR_ONLY_TEST && ENABLE_LASER_OUTPUT && buttonPressed ? HIGH : LOW);
+}
+
+void updateRange() {
+  uint32_t now = micros();
+  bool ready = false, timedOut = false;
+  uint32_t width = 0;
+  // Atomic copy: 32-bit timestamps require multiple instructions on AVR.
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+    if (rangeState == 3) {
+      width = echoWidthUs;
+      rangeState = 0;
+      ready = true;
+    } else if (rangeState != 0 && now - lastPingUs >= 30000UL) {
+      rangeState = 0;
+      timedOut = true;
+    }
+  }
+  if (ready) {
+    rangeError = (width >= 116UL && width <= 23200UL) ? 0 : 3;
+    distanceCm = rangeError == 0 ? (int)((width + 29UL) / 58UL) : -1;
+    reportRange(width);
+  } else if (timedOut) {
+    rangeError = digitalRead(ECHO_PIN) == HIGH ? 2 : 1;
+    distanceCm = -1;
+    reportRange(0);
+  }
+  if (rangeState == 0) {
+    if (now - lastPingUs < 100000UL) return;
+    lastPingUs = now;
+    if (digitalRead(ECHO_PIN) == HIGH) {
+      distanceCm = -1; rangeError = 2; reportRange(0); return;
+    }
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+      echoWidthUs = 0;
+      rangeState = 1; // Arm before trigger, not after the returning echo.
+    }
+    digitalWrite(TRIG_PIN, LOW);
+    delayMicroseconds(3);
+    digitalWrite(TRIG_PIN, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(TRIG_PIN, LOW);
+  }
+}
+
+void updateStepper() {
+  if (SENSOR_ONLY_TEST) return;
+  uint32_t nowMs = millis();
+  int target = (long)xCommand * MAX_STEP_RATE / 100;
+  // Stop immediately at centre; ramp starts and direction changes.
+  if (target == 0) stepRate = 0;
+  if (nowMs - lastRampMs >= 10) {
+    lastRampMs = nowMs;
+    if (stepRate < target) stepRate = min(stepRate + 15, target);
+    if (stepRate > target) stepRate = max(stepRate - 15, target);
+  }
+  uint32_t nowUs = micros();
+  if (!stepRate) { lastStepUs = nowUs; return; }
+  int direction = stepRate > 0 ? 1 : -1;
+  if ((direction > 0 && panPosition >= PAN_LIMIT) ||
+      (direction < 0 && panPosition <= -PAN_LIMIT)) {
+    stepRate = 0; lastStepUs = nowUs; return;
+  }
+  if (nowUs - lastStepUs < 1000000UL / abs(stepRate)) return;
+  lastStepUs = nowUs;
+  phase = (phase + (direction > 0 ? 1 : 7)) & 7;
+  setMotorPhase();
+  panPosition += direction;
+}
+
+void updateControlsAndTilt() {
+  uint32_t now = millis();
+  if (now - lastControlsMs >= 10) {
+    lastControlsMs = now;
+    xCommand = readAxis(A0, centreX, REVERSE_X);
+    yCommand = readAxis(A1, centreY, REVERSE_Y);
+  }
+  if (!SENSOR_ONLY_TEST && now - lastTiltMs >= 20) {
+    lastTiltMs = now;
+    tiltAngle = constrain(tiltAngle + yCommand * 0.009f, TILT_MIN, TILT_MAX);
+    tiltServo.write((int)(tiltAngle + 0.5f));
+  }
+}
+
+void updateDisplay() {
+  uint32_t now = millis();
+  if (displayIndex == 0 && now - lastTextMs >= 200) {
+    lastTextMs = now;
+    if (rangeError == 1) snprintf(topLine, sizeof(topLine), "No echo         ");
+    else if (rangeError == 2) snprintf(topLine, sizeof(topLine), "Echo stuck HIGH ");
+    else if (rangeError == 3) snprintf(topLine, sizeof(topLine), "Out of range    ");
+    else snprintf(topLine, sizeof(topLine), "Dist: %3d cm    ", distanceCm);
+    snprintf(bottomLine, sizeof(bottomLine), "Tilt:%3d B:%d    ",
+             (int)(tiltAngle + 0.5f), buttonPressed ? 1 : 0);
+  }
+  // One character per update avoids long LCD writes interrupting stepping.
+  if (now - lastDisplayMs < 3) return;
+  lastDisplayMs = now;
+  lcd.setCursor(displayIndex % 16, displayIndex / 16);
+  lcd.write(displayIndex < 16 ? topLine[displayIndex] : bottomLine[displayIndex - 16]);
+  displayIndex = (displayIndex + 1) % 32;
+}
+
+void setup() {
+  Serial.begin(115200);
+  digitalWrite(LASER_PIN, LOW);
+  pinMode(LASER_PIN, OUTPUT);
+  pinMode(LED_BUILTIN, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(TRIG_PIN, OUTPUT);
+  digitalWrite(TRIG_PIN, LOW);
+  pinMode(ECHO_PIN, INPUT);
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+    PCMSK0 |= _BV(PCINT1); // D9 only; other Port B pins do not trigger ISR.
+    PCIFR = _BV(PCIF0);   // Clear any pending Port B pin-change flag.
+    PCICR |= _BV(PCIE0);
+  }
+  for (uint8_t i = 0; i < 4; ++i) pinMode(MOTOR_PINS[i], OUTPUT);
+  lcd.begin(16, 2);
+  lcd.print(F("Centre joystick"));
+  long sumX = 0, sumY = 0;
+  for (uint8_t i = 0; i < 32; ++i) {
+    sumX += analogRead(A0); sumY += analogRead(A1); delay(5);
+  }
+  centreX = sumX / 32; centreY = sumY / 32;
+  // Reject extreme calibration caused by holding joystick at an end stop.
+  if (centreX < 300 || centreX > 700) centreX = 512;
+  if (centreY < 300 || centreY > 700) centreY = 512;
+  if (!SENSOR_ONLY_TEST) {
+    tiltServo.attach(SERVO_PIN, 1000, 2000); // Conservative pulse range.
+    tiltServo.write(90);
+    setMotorPhase(); // Coils stay energized to hold pan at centre.
+  } else {
+    pinMode(SERVO_PIN, OUTPUT);
+    digitalWrite(SERVO_PIN, LOW);
+    for (uint8_t i = 0; i < 4; ++i) digitalWrite(MOTOR_PINS[i], LOW);
+  }
+  lcd.clear();
+  lastRaw = digitalRead(BUTTON_PIN);
+  rawChangedMs = millis();
+  lastPingUs = micros();
+}
+
+void loop() {
+  updateRange();
+  updateButton();
+  updateControlsAndTilt();
+  updateStepper();
+  updateDisplay();
+}
